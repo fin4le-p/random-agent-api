@@ -27,7 +27,7 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ./api
+          context: .
           push: true
           tags: ghcr.io/fin4le-p/random-agent-api:latest
 

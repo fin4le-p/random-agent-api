@@ -100,3 +100,17 @@ def account_by_riot_id(game_name: str, tag_line: str) -> dict:
     tag_line_enc = urllib.parse.quote(tag_line, safe="")
     url = f"https://{account_region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name_enc}/{tag_line_enc}"
     return _json_request(url, method="GET", headers={"X-Riot-Token": api_key}, timeout=10)
+
+def account_me(access_token: str) -> dict:
+    """
+    公式: GET /riot/account/v1/accounts/me
+    access token で puuid / gameName / tagLine を取る
+    """
+    account_region = getattr(settings, "RIOT_ACCOUNT_REGION", "asia")  # americas/europe/asia
+    url = f"https://{account_region}.api.riotgames.com/riot/account/v1/accounts/me"
+    return _json_request(
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )

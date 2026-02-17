@@ -22,6 +22,7 @@ from .riot import (
     refresh_access_token,
     calc_expires_at,
     account_by_riot_id,
+    account_me,  # ★追加
 )
 from .val_match import matchlist_by_puuid, match_by_id
 
@@ -69,6 +70,9 @@ class InternalCreateAuthUrl(APIView):
 
 
 class InternalExchangeCode(APIView):
+    """
+    Link（callback）時点で gameName/tagLine/puuid まで確定させて保存する
+    """
     permission_classes = [InternalAPIKeyPermission]
 
     @transaction.atomic
@@ -97,24 +101,27 @@ class InternalExchangeCode(APIView):
             scope = token_json.get("scope", "")
             token_type = token_json.get("token_type", "Bearer")
 
-            userinfo = fetch_userinfo(access_token)
-            riot_subject = userinfo.get("sub", "") or ""
-            if not riot_subject:
-                return Response(
-                    {"error": "missing_userinfo_sub", "userinfo_keys": list(userinfo.keys())},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            # ★1) sub は userinfo（openid）で取れるなら取る（無くても通す）
+            riot_subject = ""
+            try:
+                userinfo = fetch_userinfo(access_token)
+                riot_subject = userinfo.get("sub", "") or ""
+            except Exception:
+                riot_subject = ""
 
-            game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or ""
-            tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or ""
+            # ★2) ここが本命：公式 accounts/me で puuid / gameName / tagLine を確定
+            me = account_me(access_token)
+            game_name = me.get("gameName", "") or ""
+            tag_line = me.get("tagLine", "") or ""
+            puuid = me.get("puuid", "") or ""
 
-            # PUUID を確定（game_name/tag_line から account-v1）
-            puuid = ""
-            if game_name and tag_line:
+            # accounts/me が一部欠けるケースの保険（公式のみ）
+            # gameName/tagLine が取れてるのに puuid が空なら account-v1 by-riot-id で補完
+            if (not puuid) and game_name and tag_line:
                 try:
                     acct = account_by_riot_id(game_name, tag_line)
                     puuid = acct.get("puuid", "") or ""
-                except Exception as _e:
+                except Exception:
                     puuid = ""
 
             link, _created = AccountLink.objects.update_or_create(
@@ -223,63 +230,85 @@ class InternalLinkStatus(APIView):
 
 
 class InternalMe(APIView):
+    """
+    連携確認ではなく「直近1試合が取れる」ことを確認するためのエンドポイント
+    - refresh 等はここではやらない（連携機能は無視）
+    """
     permission_classes = [InternalAPIKeyPermission]
 
-    @transaction.atomic
     def post(self, request):
         discord_user_id = int(request.data.get("discord_user_id", 0))
         if not discord_user_id:
             return Response({"error": "missing_discord_user_id"}, status=400)
 
-        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
-        if not link or not hasattr(link, "token"):
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
+        if not link:
             return Response({"error": "not_linked"}, status=404)
 
-        tok = link.token
+        if not link.riot_puuid:
+            return Response({"error": "missing_puuid"}, status=404)
 
-        refreshed = False
-        if tok.is_expired():
-            refresh_token = decrypt(tok.refresh_token_enc)
-            new_tok = refresh_access_token(refresh_token)
+        api_key = getattr(settings, "RIOT_API_KEY", "")
+        if not api_key:
+            return Response({"error": "server_misconfigured_riot_api_key"}, status=500)
 
-            tok.access_token = new_tok["access_token"]
-            new_refresh = new_tok.get("refresh_token")
-            if new_refresh:
-                tok.refresh_token_enc = encrypt(new_refresh)
-            tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
-            tok.scope = new_tok.get("scope", tok.scope)
-            tok.token_type = new_tok.get("token_type", tok.token_type)
-            tok.save(update_fields=["access_token", "refresh_token_enc", "expires_at", "scope", "token_type", "updated_at"])
-            refreshed = True
+        region = getattr(settings, "VAL_MATCH_REGION", None) or (link.region or "ap")
 
-        userinfo = fetch_userinfo(tok.access_token)
-        game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or link.riot_game_name or ""
-        tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or link.riot_tag_line or ""
+        try:
+            ml = matchlist_by_puuid(region, api_key, link.riot_puuid)
+            history = (ml.get("history", []) or [])
+            if not history:
+                return Response({"error": "no_match_history"}, status=404)
 
-        # PUUID が空ならここで埋める（保険）
-        if (not link.riot_puuid) and game_name and tag_line:
-            try:
-                acct = account_by_riot_id(game_name, tag_line)
-                puuid = acct.get("puuid", "") or ""
-                if puuid:
-                    link.riot_puuid = puuid
-                    link.save(update_fields=["riot_puuid", "updated_at"])
-            except Exception:
-                pass
+            match_id = history[0].get("matchId")
+            if not match_id:
+                return Response({"error": "invalid_match_history"}, status=502)
 
-        return Response(
-            {
-                "ok": True,
-                "refreshed": refreshed,
-                "discord_user_id": link.discord_user_id,
-                "riot_subject": userinfo.get("sub", "") or link.riot_subject,
-                "game_name": game_name,
-                "tag_line": tag_line,
-                "puuid": link.riot_puuid,
-                "expires_at": tok.expires_at,
-            },
-            status=200,
-        )
+            m = match_by_id(region, api_key, match_id)
+            info = m.get("matchInfo", {}) or {}
+            players = m.get("players", []) or []
+            teams = m.get("teams", []) or []
+
+            me = next((p for p in players if p.get("puuid") == link.riot_puuid), None)
+            if not me:
+                return Response({"error": "player_not_found_in_match"}, status=502)
+
+            team_id = me.get("teamId")
+            stats0 = (me.get("stats", {}) or {})
+            kills = int(stats0.get("kills", 0))
+            deaths = int(stats0.get("deaths", 0))
+            assists = int(stats0.get("assists", 0))
+            score = int(stats0.get("score", 0))
+            rounds = int(stats0.get("roundsPlayed", 0)) or 1
+            acs = round(score / rounds, 1)
+
+            my_team = next((t for t in teams if t.get("teamId") == team_id), None)
+            won = bool(my_team.get("won")) if my_team else None
+
+            return Response(
+                {
+                    "ok": True,
+                    "riotId": f"{link.riot_game_name}#{link.riot_tag_line}".strip("#"),
+                    "puuid": link.riot_puuid,
+                    "region": region,
+                    "match": {
+                        "matchId": match_id,
+                        "map": _map_name(info.get("mapId", "")),
+                        "mode": info.get("gameMode", "") or info.get("queueId", ""),
+                        "isCompleted": bool(info.get("isCompleted", True)),
+                        "won": won,
+                        "k": kills,
+                        "d": deaths,
+                        "a": assists,
+                        "acs": acs,
+                        "teamId": team_id,
+                        "gameStartMillis": info.get("gameStartMillis"),
+                    },
+                }
+            )
+
+        except Exception as e:
+            return Response({"error": "match_fetch_exception", "detail": repr(e)}, status=502)
 
 
 class InternalValorantRecentMatches(APIView):
@@ -297,7 +326,7 @@ class InternalValorantRecentMatches(APIView):
         if not link:
             return Response({"error": "not_linked"}, status=404)
 
-        # PUUID が無ければ account-v1 で埋める（ここで確定させる）
+        # PUUID が無ければ account-v1 で埋める（公式のみ）
         if not link.riot_puuid:
             if not (link.riot_game_name and link.riot_tag_line):
                 return Response({"error": "not_linked_or_missing_riot_id"}, status=404)

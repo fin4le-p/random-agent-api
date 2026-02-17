@@ -38,4 +38,6 @@ exec gunicorn app.wsgi:application \
   --threads 4 \
   --timeout 60 \
   --access-logfile - \
-  --error-logfile -
+  --error-logfile - \
+  --log-level debug \
+  --capture-output

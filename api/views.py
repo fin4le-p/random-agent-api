@@ -1,6 +1,7 @@
 import secrets
 import urllib.parse
 from datetime import timedelta
+import traceback
 
 from django.conf import settings
 from django.db import transaction
@@ -38,7 +39,6 @@ class InternalCreateAuthUrl(APIView):
         discord_guild_id = ser.validated_data.get("discord_guild_id")
         region = ser.validated_data.get("region", "ap")
 
-        # stateはサーバ側で作ってDBに保存（安全）
         state = secrets.token_urlsafe(32)
         OAuthState.objects.create(
             state=state,
@@ -68,63 +68,78 @@ class InternalExchangeCode(APIView):
         if not st or st.is_expired():
             return Response({"error": "invalid_or_expired_state"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 使い捨てにする
-        st.delete()
+        try:
+            # 1) code -> token
+            token_json = exchange_code_for_token(code)
 
-        token_json = exchange_code_for_token(code)
-        access_token = token_json["access_token"]
-        refresh_token = token_json.get("refresh_token")
-        if not refresh_token:
-            return Response({"error": "missing_refresh_token"}, status=status.HTTP_400_BAD_REQUEST)
+            access_token = token_json["access_token"]
+            refresh_token = token_json.get("refresh_token")
+            if not refresh_token:
+                return Response({"error": "missing_refresh_token", "token_keys": list(token_json.keys())},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-        expires_at = calc_expires_at(int(token_json.get("expires_in", 3600)))
-        scope = token_json.get("scope", "")
-        token_type = token_json.get("token_type", "Bearer")
+            expires_at = calc_expires_at(int(token_json.get("expires_in", 3600)))
+            scope = token_json.get("scope", "")
+            token_type = token_json.get("token_type", "Bearer")
 
-        userinfo = fetch_userinfo(access_token)
-        riot_subject = userinfo.get("sub", "")
-        if not riot_subject:
-            return Response({"error": "missing_userinfo_sub"}, status=status.HTTP_400_BAD_REQUEST)
+            # 2) userinfo
+            userinfo = fetch_userinfo(access_token)
+            riot_subject = userinfo.get("sub", "")
+            if not riot_subject:
+                return Response({"error": "missing_userinfo_sub", "userinfo_keys": list(userinfo.keys())},
+                                status=status.HTTP_400_BAD_REQUEST)
 
-        # 任意：表示名が取れるなら保存（環境によってフィールド名が違う場合あり）
-        game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or ""
-        tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or ""
+            game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or ""
+            tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or ""
 
-        link, _created = AccountLink.objects.update_or_create(
-            discord_user_id=st.discord_user_id,
-            defaults={
-                "discord_guild_id": st.discord_guild_id,
-                "riot_subject": riot_subject,
-                "riot_game_name": game_name,
-                "riot_tag_line": tag_line,
-            },
-        )
+            # 3) upsert link/token
+            link, _created = AccountLink.objects.update_or_create(
+                discord_user_id=st.discord_user_id,
+                defaults={
+                    "discord_guild_id": st.discord_guild_id,
+                    "riot_subject": riot_subject,
+                    "riot_game_name": game_name,
+                    "riot_tag_line": tag_line,
+                    "region": getattr(st, "region", "ap") if hasattr(st, "region") else "ap",
+                },
+            )
 
-        RiotToken.objects.update_or_create(
-            link=link,
-            defaults={
-                "access_token": access_token,
-                "refresh_token_enc": encrypt(refresh_token),
-                "expires_at": expires_at,
-                "scope": scope,
-                "token_type": token_type,
-            },
-        )
+            RiotToken.objects.update_or_create(
+                link=link,
+                defaults={
+                    "access_token": access_token,
+                    "refresh_token_enc": encrypt(refresh_token),
+                    "expires_at": expires_at,
+                    "scope": scope,
+                    "token_type": token_type,
+                },
+            )
 
-        return Response({
-            "ok": True,
-            "discord_user_id": link.discord_user_id,
-            "riot_subject": link.riot_subject,
-            "riot_game_name": link.riot_game_name,
-            "riot_tag_line": link.riot_tag_line,
-        })
+            # 4) 成功したら state を消費（最後に delete）
+            st.delete()
+
+            return Response({
+                "ok": True,
+                "discord_user_id": link.discord_user_id,
+                "riot_subject": link.riot_subject,
+                "riot_game_name": link.riot_game_name,
+                "riot_tag_line": link.riot_tag_line,
+            })
+
+        except Exception as e:
+            # ここが “今あなたの環境で起きてる 500 の正体” を必ず出す
+            tb = traceback.format_exc()
+            print("[InternalExchangeCode] exception:", repr(e))
+            print(tb)
+
+            # Next 側でも読めるように JSON で返す（機密を出しすぎない）
+            return Response(
+                {"error": "exchange_exception", "detail": repr(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class InternalEnsureFreshToken(APIView):
-    """
-    期限切れならrefreshしてDB更新。期限内なら何もしない。
-    Bot/HPが試合取得前に叩く想定
-    """
     permission_classes = [InternalAPIKeyPermission]
 
     @transaction.atomic
@@ -154,4 +169,3 @@ class InternalEnsureFreshToken(APIView):
         tok.save(update_fields=["access_token","refresh_token_enc","expires_at","scope","token_type","updated_at"])
 
         return Response({"ok": True, "refreshed": True})
-    

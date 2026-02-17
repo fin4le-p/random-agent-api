@@ -1,4 +1,4 @@
-import os
+# api/views.py
 import secrets
 import urllib.parse
 from datetime import timedelta
@@ -21,12 +21,10 @@ from .riot import (
     fetch_userinfo,
     refresh_access_token,
     calc_expires_at,
+    account_by_riot_id,
 )
+from .val_match import matchlist_by_puuid, match_by_id
 
-
-# -------------------------
-# helpers
-# -------------------------
 
 def build_authorize_url(state: str) -> str:
     params = {
@@ -36,51 +34,15 @@ def build_authorize_url(state: str) -> str:
         "scope": "openid offline_access",
         "state": state,
     }
-    return f"{settings.RIOT_AUTH_BASE}/authorize?" + urllib.parse.urlencode(params)
+    return f"{settings.RIOT_AUTH_BASE.rstrip('/')}/authorize?" + urllib.parse.urlencode(params)
 
 
-def _has_token_enc_key() -> bool:
-    # TOKEN_ENC_KEY は settings 経由でも env 直でもいいが、あなたの crypto.py が env を見るなら env を優先
-    return bool(getattr(settings, "TOKEN_ENC_KEY", None) or os.getenv("TOKEN_ENC_KEY"))
+def _map_name(map_id: str) -> str:
+    if not map_id:
+        return "Unknown"
+    s = map_id.strip("/").split("/")[-1]
+    return s or map_id
 
-
-def _get_link_token(link: AccountLink):
-    """
-    link.token が OneToOne の想定。
-    ただしモデル次第で例外出る可能性があるので安全に取る。
-    """
-    try:
-        return getattr(link, "token", None)
-    except Exception:
-        return None
-
-
-def _update_token_from_refresh(tok: RiotToken) -> bool:
-    """
-    期限切れなら refresh して tok を更新して保存する。
-    更新が発生したら True。
-    """
-    if not tok.is_expired():
-        return False
-
-    refresh_token = decrypt(tok.refresh_token_enc)
-    new_tok = refresh_access_token(refresh_token)
-
-    tok.access_token = new_tok["access_token"]
-    new_refresh = new_tok.get("refresh_token")
-    if new_refresh:
-        tok.refresh_token_enc = encrypt(new_refresh)
-
-    tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
-    tok.scope = new_tok.get("scope", tok.scope)
-    tok.token_type = new_tok.get("token_type", tok.token_type)
-    tok.save(update_fields=["access_token", "refresh_token_enc", "expires_at", "scope", "token_type", "updated_at"])
-    return True
-
-
-# -------------------------
-# views
-# -------------------------
 
 class InternalCreateAuthUrl(APIView):
     permission_classes = [InternalAPIKeyPermission]
@@ -91,52 +53,36 @@ class InternalCreateAuthUrl(APIView):
 
         discord_user_id = int(ser.validated_data["discord_user_id"])
         discord_guild_id = ser.validated_data.get("discord_guild_id")
-        region = ser.validated_data.get("region", "ap")
+        region = ser.validated_data.get("region") or "ap"
 
-        state = secrets.token_urlsafe(32)
-
-        # OAuthState に region カラムが無いケースでも落ちないように
-        create_kwargs = dict(
-            state=state,
+        state_val = secrets.token_urlsafe(32)
+        OAuthState.objects.create(
+            state=state_val,
             discord_user_id=discord_user_id,
             discord_guild_id=discord_guild_id,
+            region=region,
             expires_at=timezone.now() + timedelta(minutes=10),
         )
-        if hasattr(OAuthState, "region"):
-            create_kwargs["region"] = region
 
-        OAuthState.objects.create(**create_kwargs)
-
-        url = build_authorize_url(state)
-        return Response({"authorize_url": url, "state": state, "region": region})
+        url = build_authorize_url(state_val)
+        return Response({"authorize_url": url, "state": state_val, "region": region})
 
 
 class InternalExchangeCode(APIView):
-    """
-    Next の callback から code/state を受け取り、token交換して保存
-    """
     permission_classes = [InternalAPIKeyPermission]
 
     @transaction.atomic
     def post(self, request):
-        # 暗号鍵が無いと refresh_token の保存で必ず落ちるので、早めにエラー化
-        if not _has_token_enc_key():
-            return Response(
-                {"error": "server_misconfigured", "detail": "TOKEN_ENC_KEY is not set"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
         ser = ExchangeCodeRequest(data=request.data)
         ser.is_valid(raise_exception=True)
         code = ser.validated_data["code"]
-        state = ser.validated_data["state"]
+        state_val = ser.validated_data["state"]
 
-        st = OAuthState.objects.filter(state=state).first()
+        st = OAuthState.objects.filter(state=state_val).first()
         if not st or st.is_expired():
             return Response({"error": "invalid_or_expired_state"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # 1) code -> token
             token_json = exchange_code_for_token(code)
 
             access_token = token_json["access_token"]
@@ -151,9 +97,8 @@ class InternalExchangeCode(APIView):
             scope = token_json.get("scope", "")
             token_type = token_json.get("token_type", "Bearer")
 
-            # 2) userinfo
             userinfo = fetch_userinfo(access_token)
-            riot_subject = userinfo.get("sub", "")
+            riot_subject = userinfo.get("sub", "") or ""
             if not riot_subject:
                 return Response(
                     {"error": "missing_userinfo_sub", "userinfo_keys": list(userinfo.keys())},
@@ -163,8 +108,14 @@ class InternalExchangeCode(APIView):
             game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or ""
             tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or ""
 
-            # 3) upsert link/token
-            region = getattr(st, "region", "ap") if hasattr(st, "region") else "ap"
+            # PUUID を確定（game_name/tag_line から account-v1）
+            puuid = ""
+            if game_name and tag_line:
+                try:
+                    acct = account_by_riot_id(game_name, tag_line)
+                    puuid = acct.get("puuid", "") or ""
+                except Exception as _e:
+                    puuid = ""
 
             link, _created = AccountLink.objects.update_or_create(
                 discord_user_id=st.discord_user_id,
@@ -173,7 +124,8 @@ class InternalExchangeCode(APIView):
                     "riot_subject": riot_subject,
                     "riot_game_name": game_name,
                     "riot_tag_line": tag_line,
-                    "region": region,
+                    "riot_puuid": puuid,
+                    "region": st.region or "ap",
                 },
             )
 
@@ -188,7 +140,6 @@ class InternalExchangeCode(APIView):
                 },
             )
 
-            # 4) 成功したら state を消費
             st.delete()
 
             return Response(
@@ -198,8 +149,8 @@ class InternalExchangeCode(APIView):
                     "riot_subject": link.riot_subject,
                     "riot_game_name": link.riot_game_name,
                     "riot_tag_line": link.riot_tag_line,
-                },
-                status=200,
+                    "riot_puuid": link.riot_puuid,
+                }
             )
 
         except Exception as e:
@@ -217,32 +168,34 @@ class InternalEnsureFreshToken(APIView):
 
     @transaction.atomic
     def post(self, request):
-        if not _has_token_enc_key():
-            return Response(
-                {"error": "server_misconfigured", "detail": "TOKEN_ENC_KEY is not set"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
         discord_user_id = int(request.data.get("discord_user_id", 0))
         if not discord_user_id:
             return Response({"error": "missing_discord_user_id"}, status=400)
 
-        link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
-        if not link:
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
+        if not link or not hasattr(link, "token"):
             return Response({"error": "not_linked"}, status=404)
 
-        tok = _get_link_token(link)
-        if not tok:
-            return Response({"error": "missing_token"}, status=404)
+        tok = link.token
+        if not tok.is_expired():
+            return Response({"ok": True, "refreshed": False})
 
-        refreshed = _update_token_from_refresh(tok)
-        return Response({"ok": True, "refreshed": refreshed}, status=200)
+        refresh_token = decrypt(tok.refresh_token_enc)
+        new_tok = refresh_access_token(refresh_token)
+
+        tok.access_token = new_tok["access_token"]
+        new_refresh = new_tok.get("refresh_token")
+        if new_refresh:
+            tok.refresh_token_enc = encrypt(new_refresh)
+        tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
+        tok.scope = new_tok.get("scope", tok.scope)
+        tok.token_type = new_tok.get("token_type", tok.token_type)
+        tok.save(update_fields=["access_token", "refresh_token_enc", "expires_at", "scope", "token_type", "updated_at"])
+
+        return Response({"ok": True, "refreshed": True})
 
 
 class InternalLinkStatus(APIView):
-    """
-    discord_user_id の連携状況を返す
-    """
     permission_classes = [InternalAPIKeyPermission]
 
     def post(self, request):
@@ -250,71 +203,69 @@ class InternalLinkStatus(APIView):
         if not discord_user_id:
             return Response({"error": "missing_discord_user_id"}, status=400)
 
-        link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
         if not link:
             return Response({"linked": False}, status=200)
 
-        tok = _get_link_token(link)
+        has_token = hasattr(link, "token")
         return Response(
             {
                 "linked": True,
-                "has_token": bool(tok),
+                "has_token": bool(has_token),
                 "riot_game_name": link.riot_game_name,
                 "riot_tag_line": link.riot_tag_line,
                 "riot_subject": link.riot_subject,
-                "expires_at": tok.expires_at if tok else None,
+                "riot_puuid": link.riot_puuid,
+                "expires_at": link.token.expires_at if has_token else None,
             },
             status=200,
         )
 
 
 class InternalMe(APIView):
-    """
-    Botが叩く：期限切れならrefresh→userinfoを取って返す（疎通確認用）
-    """
     permission_classes = [InternalAPIKeyPermission]
 
     @transaction.atomic
     def post(self, request):
-        if not _has_token_enc_key():
-            return Response(
-                {"error": "server_misconfigured", "detail": "TOKEN_ENC_KEY is not set"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
         discord_user_id = int(request.data.get("discord_user_id", 0))
         if not discord_user_id:
             return Response({"error": "missing_discord_user_id"}, status=400)
 
-        # select_related("token") がモデル次第で失敗する可能性があるので安全に
-        try:
-            link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
-        except Exception:
-            link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
-
-        if not link:
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
+        if not link or not hasattr(link, "token"):
             return Response({"error": "not_linked"}, status=404)
 
-        tok = _get_link_token(link)
-        if not tok:
-            return Response({"error": "missing_token"}, status=404)
+        tok = link.token
 
-        refreshed = _update_token_from_refresh(tok)
+        refreshed = False
+        if tok.is_expired():
+            refresh_token = decrypt(tok.refresh_token_enc)
+            new_tok = refresh_access_token(refresh_token)
+
+            tok.access_token = new_tok["access_token"]
+            new_refresh = new_tok.get("refresh_token")
+            if new_refresh:
+                tok.refresh_token_enc = encrypt(new_refresh)
+            tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
+            tok.scope = new_tok.get("scope", tok.scope)
+            tok.token_type = new_tok.get("token_type", tok.token_type)
+            tok.save(update_fields=["access_token", "refresh_token_enc", "expires_at", "scope", "token_type", "updated_at"])
+            refreshed = True
 
         userinfo = fetch_userinfo(tok.access_token)
+        game_name = userinfo.get("game_name", "") or userinfo.get("acct", {}).get("game_name", "") or link.riot_game_name or ""
+        tag_line = userinfo.get("tag_line", "") or userinfo.get("acct", {}).get("tag_line", "") or link.riot_tag_line or ""
 
-        game_name = (
-            userinfo.get("game_name", "")
-            or userinfo.get("acct", {}).get("game_name", "")
-            or link.riot_game_name
-            or ""
-        )
-        tag_line = (
-            userinfo.get("tag_line", "")
-            or userinfo.get("acct", {}).get("tag_line", "")
-            or link.riot_tag_line
-            or ""
-        )
+        # PUUID が空ならここで埋める（保険）
+        if (not link.riot_puuid) and game_name and tag_line:
+            try:
+                acct = account_by_riot_id(game_name, tag_line)
+                puuid = acct.get("puuid", "") or ""
+                if puuid:
+                    link.riot_puuid = puuid
+                    link.save(update_fields=["riot_puuid", "updated_at"])
+            except Exception:
+                pass
 
         return Response(
             {
@@ -324,7 +275,100 @@ class InternalMe(APIView):
                 "riot_subject": userinfo.get("sub", "") or link.riot_subject,
                 "game_name": game_name,
                 "tag_line": tag_line,
+                "puuid": link.riot_puuid,
                 "expires_at": tok.expires_at,
             },
             status=200,
+        )
+
+
+class InternalValorantRecentMatches(APIView):
+    permission_classes = [InternalAPIKeyPermission]
+
+    def post(self, request):
+        discord_user_id = int(request.data.get("discord_user_id", 0))
+        count = int(request.data.get("count", 5))
+        count = max(1, min(count, 10))
+
+        if not discord_user_id:
+            return Response({"error": "missing_discord_user_id"}, status=400)
+
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
+        if not link:
+            return Response({"error": "not_linked"}, status=404)
+
+        # PUUID が無ければ account-v1 で埋める（ここで確定させる）
+        if not link.riot_puuid:
+            if not (link.riot_game_name and link.riot_tag_line):
+                return Response({"error": "not_linked_or_missing_riot_id"}, status=404)
+            try:
+                acct = account_by_riot_id(link.riot_game_name, link.riot_tag_line)
+                puuid = acct.get("puuid", "") or ""
+                if not puuid:
+                    return Response({"error": "puuid_lookup_failed"}, status=502)
+                link.riot_puuid = puuid
+                link.save(update_fields=["riot_puuid", "updated_at"])
+            except Exception as e:
+                return Response({"error": "puuid_lookup_exception", "detail": repr(e)}, status=502)
+
+        api_key = getattr(settings, "RIOT_API_KEY", "")
+        if not api_key:
+            return Response({"error": "server_misconfigured_riot_api_key"}, status=500)
+
+        region = getattr(settings, "VAL_MATCH_REGION", None) or (link.region or "ap")
+
+        ml = matchlist_by_puuid(region, api_key, link.riot_puuid)
+        history = (ml.get("history", []) or [])[:count]
+
+        items = []
+        for h in history:
+            match_id = h.get("matchId")
+            if not match_id:
+                continue
+
+            m = match_by_id(region, api_key, match_id)
+            info = m.get("matchInfo", {}) or {}
+            players = m.get("players", []) or []
+            teams = m.get("teams", []) or []
+
+            me = next((p for p in players if p.get("puuid") == link.riot_puuid), None)
+            if not me:
+                continue
+
+            team_id = me.get("teamId")
+            stats0 = (me.get("stats", {}) or {})
+            kills = int(stats0.get("kills", 0))
+            deaths = int(stats0.get("deaths", 0))
+            assists = int(stats0.get("assists", 0))
+            score = int(stats0.get("score", 0))
+            rounds = int(stats0.get("roundsPlayed", 0)) or 1
+            acs = round(score / rounds, 1)
+
+            my_team = next((t for t in teams if t.get("teamId") == team_id), None)
+            won = bool(my_team.get("won")) if my_team else None
+
+            items.append(
+                {
+                    "matchId": match_id,
+                    "map": _map_name(info.get("mapId", "")),
+                    "mode": info.get("gameMode", "") or info.get("queueId", ""),
+                    "isCompleted": bool(info.get("isCompleted", True)),
+                    "won": won,
+                    "k": kills,
+                    "d": deaths,
+                    "a": assists,
+                    "acs": acs,
+                    "teamId": team_id,
+                    "gameStartMillis": info.get("gameStartMillis"),
+                }
+            )
+
+        return Response(
+            {
+                "ok": True,
+                "riotId": f"{link.riot_game_name}#{link.riot_tag_line}".strip("#"),
+                "puuid": link.riot_puuid,
+                "region": region,
+                "matches": items,
+            }
         )

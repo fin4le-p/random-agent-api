@@ -37,6 +37,11 @@ RIOT_CLIENT_SECRET = os.getenv("RIOT_CLIENT_SECRET", "")
 RIOT_REDIRECT_URI = os.getenv("RIOT_REDIRECT_URI", "")  # Nextの callback URL
 RIOT_AUTH_BASE = os.getenv("RIOT_AUTH_BASE", "https://auth.riotgames.com")
 
+# Developer Portal の API Key（Account-V1 と VAL-MATCH 用）
+RIOT_API_KEY = os.getenv("RIOT_API_KEY", "")
+RIOT_ACCOUNT_REGION = os.getenv("RIOT_ACCOUNT_REGION", "asia")
+VAL_MATCH_REGION = os.getenv("VAL_MATCH_REGION", "ap")
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 

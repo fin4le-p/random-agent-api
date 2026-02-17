@@ -36,6 +36,8 @@ RIOT_CLIENT_ID = os.getenv("RIOT_CLIENT_ID", "")
 RIOT_CLIENT_SECRET = os.getenv("RIOT_CLIENT_SECRET", "")
 RIOT_REDIRECT_URI = os.getenv("RIOT_REDIRECT_URI", "")  # Nextの callback URL
 RIOT_AUTH_BASE = os.getenv("RIOT_AUTH_BASE", "https://auth.riotgames.com")
+RIOT_TOKEN_URL = os.getenv("RIOT_TOKEN_URL", f"{RIOT_AUTH_BASE}/token")
+RIOT_USERINFO_URL = os.getenv("RIOT_USERINFO_URL", "https://auth.riotgames.com/userinfo")
 
 # Developer Portal の API Key（Account-V1 と VAL-MATCH 用）
 RIOT_API_KEY = os.getenv("RIOT_API_KEY", "")

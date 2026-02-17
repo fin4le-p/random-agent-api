@@ -26,6 +26,10 @@ DB_PSWD = os.environ.get("DB_PSWD")
 DB_HOST = os.environ.get("DB_HOST")
 DB_PORT = os.environ.get("DB_PORT")
 
+ALLOWED_HOSTS = [h.strip() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()]
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 TOKEN_ENC_KEY = os.getenv("TOKEN_ENC_KEY", "")  # Fernet key (base64url)
 RIOT_CLIENT_ID = os.getenv("RIOT_CLIENT_ID", "")
@@ -40,10 +44,7 @@ RIOT_AUTH_BASE = os.getenv("RIOT_AUTH_BASE", "https://auth.riotgames.com")
 SECRET_KEY = 'django-insecure-%jv7zff3zg)=y9ttrh+#zpj40mxzhn!q!=k-+fn$wo&#d4sgre'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
-
+DEBUG = False
 
 # Application definition
 

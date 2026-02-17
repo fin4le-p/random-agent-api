@@ -8,7 +8,6 @@ from datetime import timedelta
 from django.conf import settings
 from django.utils import timezone
 
-
 def _json_request(url: str, method: str = "GET", headers: dict | None = None, data: dict | None = None, timeout: int = 10):
     h = headers or {}
     body = None
@@ -17,10 +16,18 @@ def _json_request(url: str, method: str = "GET", headers: dict | None = None, da
         h["Content-Type"] = "application/json"
 
     req = urllib.request.Request(url, data=body, headers=h, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-        return json.loads(raw.decode("utf-8"))
 
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", "replace")
+        except Exception:
+            err_body = "<failed to read body>"
+        raise RuntimeError(f"HTTPError {e.code} {e.reason} url={url} body={err_body}") from e
 
 def calc_expires_at(expires_in_seconds: int) -> timezone.datetime:
     return timezone.now() + timedelta(seconds=int(expires_in_seconds))

@@ -154,4 +154,3 @@ class InternalEnsureFreshToken(APIView):
         tok.save(update_fields=["access_token","refresh_token_enc","expires_at","scope","token_type","updated_at"])
 
         return Response({"ok": True, "refreshed": True})
-    

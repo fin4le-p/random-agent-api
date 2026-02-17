@@ -9,6 +9,7 @@ from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 
 from .auth import InternalAPIKeyPermission
 from .serializers import CreateAuthUrlRequest, ExchangeCodeRequest
@@ -169,3 +170,90 @@ class InternalEnsureFreshToken(APIView):
         tok.save(update_fields=["access_token","refresh_token_enc","expires_at","scope","token_type","updated_at"])
 
         return Response({"ok": True, "refreshed": True})
+
+class InternalLinkStatus(APIView):
+    """
+    discord_user_id の連携状況を返す
+    """
+    permission_classes = [InternalAPIKeyPermission]
+
+    def post(self, request):
+        discord_user_id = int(request.data.get("discord_user_id", 0))
+        if not discord_user_id:
+            return Response({"error": "missing_discord_user_id"}, status=400)
+
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
+        if not link:
+            return Response({"linked": False}, status=200)
+
+        has_token = hasattr(link, "token")
+        return Response({
+            "linked": True,
+            "has_token": bool(has_token),
+            "riot_game_name": link.riot_game_name,
+            "riot_tag_line": link.riot_tag_line,
+            "riot_subject": link.riot_subject,
+            "expires_at": link.token.expires_at if has_token else None,
+        }, status=200)
+
+
+class InternalMe(APIView):
+    """
+    Botが叩く：期限切れならrefresh→userinfoを取って返す（疎通確認用）
+    """
+    permission_classes = [InternalAPIKeyPermission]
+
+    @transaction.atomic
+    def post(self, request):
+        discord_user_id = int(request.data.get("discord_user_id", 0))
+        if not discord_user_id:
+            return Response({"error": "missing_discord_user_id"}, status=400)
+
+        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
+        if not link or not hasattr(link, "token"):
+            return Response({"error": "not_linked"}, status=404)
+
+        tok = link.token
+
+        # 期限切れならrefresh
+        refreshed = False
+        if tok.is_expired():
+            refresh_token = decrypt(tok.refresh_token_enc)
+            new_tok = refresh_access_token(refresh_token)
+
+            tok.access_token = new_tok["access_token"]
+            new_refresh = new_tok.get("refresh_token")
+            if new_refresh:
+                tok.refresh_token_enc = encrypt(new_refresh)
+            tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
+            tok.scope = new_tok.get("scope", tok.scope)
+            tok.token_type = new_tok.get("token_type", tok.token_type)
+            tok.save(update_fields=["access_token","refresh_token_enc","expires_at","scope","token_type","updated_at"])
+            refreshed = True
+
+        # userinfo取得（access_tokenの疎通確認）
+        userinfo = fetch_userinfo(tok.access_token)
+
+        # 返す（できればgame_name/tag_lineを返す）
+        game_name = (
+            userinfo.get("game_name", "")
+            or userinfo.get("acct", {}).get("game_name", "")
+            or link.riot_game_name
+            or ""
+        )
+        tag_line = (
+            userinfo.get("tag_line", "")
+            or userinfo.get("acct", {}).get("tag_line", "")
+            or link.riot_tag_line
+            or ""
+        )
+
+        return Response({
+            "ok": True,
+            "refreshed": refreshed,
+            "discord_user_id": link.discord_user_id,
+            "riot_subject": userinfo.get("sub", "") or link.riot_subject,
+            "game_name": game_name,
+            "tag_line": tag_line,
+            "expires_at": tok.expires_at,
+        }, status=200)

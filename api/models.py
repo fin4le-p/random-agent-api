@@ -10,7 +10,7 @@ class AccountLink(models.Model):
     discord_guild_id = models.BigIntegerField(null=True, blank=True, db_index=True)
 
     # userinfoの sub（RSOのユーザー識別子）を保存（最低限）
-    riot_subject = models.CharField(max_length=128, db_index=True)
+    riot_subject = models.CharField(max_length=512, unique=True, db_index=True)
 
     # 表示用（取れたら入れる）
     riot_game_name = models.CharField(max_length=64, blank=True, default="")

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(os.path.join(BASE_DIR, '.env'))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 DB_NAME = os.environ.get("DB_NAME")
 DB_USER = os.environ.get("DB_USER")
@@ -89,17 +90,32 @@ WSGI_APPLICATION = 'app.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': DB_NAME,
-        'USER': DB_USER,
-        'PASSWORD': DB_PSWD,
-        'HOST': DB_HOST,
-        'PORT': DB_PORT,
+if DATABASE_URL:
+    # Docker本番用
+    u = urlparse(DATABASE_URL)
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": u.path.lstrip("/"),
+            "USER": u.username,
+            "PASSWORD": u.password,
+            "HOST": u.hostname,
+            "PORT": str(u.port or 5432),
+            "CONN_MAX_AGE": 60,
+        }
     }
-}
-
+else:
+    # ローカル開発用（今までの設定）
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': DB_NAME,
+            'USER': DB_USER,
+            'PASSWORD': DB_PSWD,
+            'HOST': DB_HOST,
+            'PORT': DB_PORT,
+        }
+    }
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators

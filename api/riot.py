@@ -9,7 +9,12 @@ from django.conf import settings
 from django.utils import timezone
 
 def _json_request(url: str, method: str = "GET", headers: dict | None = None, data: dict | None = None, timeout: int = 10):
-    h = headers or {}
+    h = dict(headers or {})
+
+    # ★ Cloudflare 1010 対策：urllib のデフォUAを避ける
+    h.setdefault("User-Agent", "Mozilla/5.0 (compatible; nakano6-rso/1.0)")
+    h.setdefault("Accept", "application/json")
+
     body = None
     if data is not None:
         body = json.dumps(data).encode("utf-8")
@@ -28,6 +33,7 @@ def _json_request(url: str, method: str = "GET", headers: dict | None = None, da
         except Exception:
             err_body = "<failed to read body>"
         raise RuntimeError(f"HTTPError {e.code} {e.reason} url={url} body={err_body}") from e
+
 
 def calc_expires_at(expires_in_seconds: int) -> timezone.datetime:
     return timezone.now() + timedelta(seconds=int(expires_in_seconds))

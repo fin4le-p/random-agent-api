@@ -7,6 +7,7 @@ from .views import (
     InternalLinkStatus,
     InternalMe,
     InternalValorantRecentMatches,
+    InternalValorantMatchHighlight,
 )
 
 urlpatterns = [
@@ -16,4 +17,5 @@ urlpatterns = [
     path("internal/rso/status", InternalLinkStatus.as_view()),
     path("internal/rso/me", InternalMe.as_view()),
     path("internal/val/recent-matches", InternalValorantRecentMatches.as_view()),
+    path("internal/val/match-highlight", InternalValorantMatchHighlight.as_view()),
 ]

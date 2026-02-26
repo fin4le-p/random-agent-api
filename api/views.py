@@ -22,9 +22,61 @@ from .riot import (
     refresh_access_token,
     calc_expires_at,
     account_by_riot_id,
-    account_me,  # ★追加
+    account_me,
 )
 from .val_match import matchlist_by_puuid, match_by_id
+
+_MAP_LABEL_BY_ASSETPATH = {
+    "/Game/Maps/Ascent/Ascent": "アセント（Ascent）",
+    "/Game/Maps/Bonsai/Bonsai": "スプリット（Split）",
+    "/Game/Maps/Canyon/Canyon": "フラクチャー（Fracture）",
+    "/Game/Maps/Duality/Duality": "バインド（Bind）",
+    "/Game/Maps/Duel/Duel_1/Skirmish_A": "スカーミッシュ A（Skirmish A）",
+    "/Game/Maps/Duel/Duel_2/Skirmish_B": "スカーミッシュ B（Skirmish B）",
+    "/Game/Maps/Duel/Duel_3/Skirmish_C": "スカーミッシュ C（Skirmish C）",
+    "/Game/Maps/Foxtrot/Foxtrot": "ブリーズ（Breeze）",
+    "/Game/Maps/HURM/HURM_Alley/HURM_Alley": "ディストリクト（District）",
+    "/Game/Maps/HURM/HURM_Bowl/HURM_Bowl": "カスバ（Kasbah）",
+    "/Game/Maps/HURM/HURM_Helix/HURM_Helix": "ドリフト（Drift）",
+    "/Game/Maps/HURM/HURM_HighTide/HURM_HighTide": "グリッチ（Glitch）",
+    "/Game/Maps/HURM/HURM_Yard/HURM_Yard": "ピアッツァ（Piazza）",
+    "/Game/Maps/Infinity/Infinity": "アビス（Abyss）",
+    "/Game/Maps/Jam/Jam": "ロータス（Lotus）",
+    "/Game/Maps/Juliett/Juliett": "サンセット（Sunset）",
+    "/Game/Maps/NPEV2/NPEV2": "基本トレーニング（Basic Training）",
+    "/Game/Maps/Pitt/Pitt": "パール（Pearl）",
+    "/Game/Maps/Port/Port": "アイスボックス（Icebox）",
+    "/Game/Maps/Poveglia/Range": "射撃場（The Range）",
+    "/Game/Maps/PovegliaV2/RangeV2": "射撃場（The Range）",
+    "/Game/Maps/Rook/Rook": "カロード（Corrode）",
+    "/Game/Maps/Triad/Triad": "ヘイヴン（Haven）",
+}
+
+_MAP_LABEL_BY_ASSETNAME = {
+    "Ascent": "アセント（Ascent）",
+    "Bonsai": "スプリット（Split）",
+    "Canyon": "フラクチャー（Fracture）",
+    "Duality": "バインド（Bind）",
+    "Skirmish_A": "スカーミッシュ A（Skirmish A）",
+    "Skirmish_B": "スカーミッシュ B（Skirmish B）",
+    "Skirmish_C": "スカーミッシュ C（Skirmish C）",
+    "Foxtrot": "ブリーズ（Breeze）",
+    "HURM_Alley": "ディストリクト（District）",
+    "HURM_Bowl": "カスバ（Kasbah）",
+    "HURM_Helix": "ドリフト（Drift）",
+    "HURM_HighTide": "グリッチ（Glitch）",
+    "HURM_Yard": "ピアッツァ（Piazza）",
+    "Infinity": "アビス（Abyss）",
+    "Jam": "ロータス（Lotus）",
+    "Juliett": "サンセット（Sunset）",
+    "NPEV2": "基本トレーニング（Basic Training）",
+    "Pitt": "パール（Pearl）",
+    "Port": "アイスボックス（Icebox）",
+    "Range": "射撃場（The Range）",
+    "RangeV2": "射撃場（The Range）",
+    "Rook": "カロード（Corrode）",
+    "Triad": "ヘイヴン（Haven）", 
+}
 
 
 def build_authorize_url(state: str) -> str:
@@ -39,10 +91,23 @@ def build_authorize_url(state: str) -> str:
 
 
 def _map_name(map_id: str) -> str:
-    if not map_id:
-        return "Unknown"
-    s = map_id.strip("/").split("/")[-1]
-    return s or map_id
+    raw = (map_id or "").strip()
+    if not raw:
+        return raw
+
+    # 1) assetPath 完全一致
+    label = _MAP_LABEL_BY_ASSETPATH.get(raw)
+    if label:
+        return label
+
+    # 2) 末尾キー（Infinity / Triad / ...）で一致
+    tail = raw.strip("/").split("/")[-1] or raw
+    label = _MAP_LABEL_BY_ASSETNAME.get(tail)
+    if label:
+        return label
+
+    # 3) どちらも無ければ従来どおり末尾を返す（Unknownにはしない）
+    return tail
 
 
 def _safe_int(v, default: int = 0) -> int:

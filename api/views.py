@@ -261,20 +261,24 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
 
     defender_collapsed = False
     attacker_dominant = False
-    atk_rounds = 0
-    atk_wins = 0
-    def_rounds = 0
-    def_wins = 0
-    for side in team_side_by_round:
+
+    # ★BUGFIX: ATK/DEF勝率は「sideだけ」じゃなく「そのラウンドの勝敗」と紐付ける
+    atk_rounds = atk_wins = 0
+    def_rounds = def_wins = 0
+    for i, side in enumerate(team_side_by_round):
+        w = my_round_wins[i] if i < len(my_round_wins) else False
         if side == "ATK":
             atk_rounds += 1
-            atk_wins += 1
+            if w:
+                atk_wins += 1
         elif side == "DEF":
             def_rounds += 1
-            def_wins += 1
-    if def_rounds >= 4 and def_wins / def_rounds <= 0.3:
+            if w:
+                def_wins += 1
+
+    if def_rounds >= 4 and (def_wins / def_rounds) <= 0.3:
         defender_collapsed = True
-    if atk_rounds >= 4 and atk_wins / atk_rounds >= 0.7:
+    if atk_rounds >= 4 and (atk_wins / atk_rounds) >= 0.7:
         attacker_dominant = True
 
     max_win_streak = 0
@@ -459,6 +463,93 @@ def _build_discord_match_message(riot_id: str, analysis: dict) -> str:
             lines.append("敗因候補: " + " / ".join(fail_points))
 
     return "\n".join(lines)
+
+
+# ★追加：LLM入力用（中身がある項目だけ出す）
+def _thin_round_for_llm(r: dict) -> dict:
+    # 必須（常に出す）
+    out = {
+        "roundNum": r.get("roundNum"),
+        "side": r.get("side"),
+        "won": r.get("won"),
+        "scoreAfterRound": r.get("scoreAfterRound"),
+        "kills": r.get("kills"),
+        "damage": r.get("damage"),
+    }
+
+    # “中身がある場合だけ”出す（0/False/Noneならキーごと省略）
+    if r.get("death"):
+        out["death"] = True
+    if r.get("assisted"):
+        out["assisted"] = True
+    if r.get("firstBlood"):
+        out["firstBlood"] = True
+    if r.get("firstDeath"):
+        out["firstDeath"] = True
+
+    mk = r.get("multiKill", 0) or 0
+    if mk >= 2:
+        out["multiKill"] = mk
+
+    cav = r.get("clutchAttemptVs", 0) or 0
+    if cav >= 2:
+        out["clutchAttemptVs"] = cav
+        if r.get("clutchWon"):
+            out["clutchWon"] = True
+
+    # もし「死んだ時間」も欲しくなったらここをONにできる（今は条件付きで出す）
+    dt = r.get("deathTimeMs")
+    if dt is not None:
+        out["deathTimeMs"] = dt
+
+    return out
+
+
+def _build_llm_payload(riot_id: str, analysis: dict) -> dict:
+    payload = {
+        "riotId": riot_id,
+        "match": {
+            "map": analysis.get("map"),
+            "queueId": analysis.get("queueId"),
+            "won": analysis.get("won"),
+            "scoreline": analysis.get("scoreline"),
+        },
+        "summary": {
+            "kda": analysis.get("kda"),
+            "kd": analysis.get("kd"),
+            "acs": analysis.get("acs"),
+            "hs_rate": analysis.get("hs_rate"),
+            "first_blood_count": analysis.get("first_blood_count"),
+            "first_death_count": analysis.get("first_death_count"),
+            "multi_kills": analysis.get("multi_kills"),
+            "max_damage_round": analysis.get("max_damage_round"),
+            "story_lines": analysis.get("story_lines", []),
+        },
+        # ★各ラウンド：中身がある項目だけ出す
+        "rounds": [
+            _thin_round_for_llm(r)
+            for r in (analysis.get("round_timeline") or [])
+            if r is not None
+        ],
+    }
+
+    # 空/冗長は出さない（質を落とさずトークン節約）
+    if (analysis.get("ace_count") or 0) > 0:
+        payload["summary"]["ace_count"] = analysis.get("ace_count")
+        if analysis.get("ace_rounds"):
+            payload["summary"]["ace_rounds"] = analysis.get("ace_rounds")
+
+    if (analysis.get("clutch_count") or 0) > 0:
+        payload["summary"]["clutch_count"] = analysis.get("clutch_count")
+        if analysis.get("clutches"):
+            payload["summary"]["clutches"] = analysis.get("clutches")
+        if analysis.get("clutch_breakdown"):
+            payload["summary"]["clutch_breakdown"] = analysis.get("clutch_breakdown")
+
+    if analysis.get("narratives"):
+        payload["narratives"] = analysis["narratives"]
+
+    return payload
 
 
 class InternalCreateAuthUrl(APIView):
@@ -865,12 +956,16 @@ class InternalValorantMatchHighlight(APIView):
             riot_id = f"{link.riot_game_name}#{link.riot_tag_line}".strip("#") or link.riot_puuid
             message = _build_discord_match_message(riot_id, analysis)
 
+            # ★追加：LLMへ投げる専用ペイロード（中身があるキーだけ出る）
+            llm_payload = _build_llm_payload(riot_id, analysis)
+
             return Response(
                 {
                     "ok": True,
                     "riotId": riot_id,
                     "region": region,
                     "analysis": analysis,
+                    "llm_payload": llm_payload,   # ★ここをLLM入力に使う
                     "discord_message": message,
                 }
             )

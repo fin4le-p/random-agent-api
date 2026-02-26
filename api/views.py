@@ -964,7 +964,6 @@ class InternalValorantMatchHighlight(APIView):
                     "ok": True,
                     "riotId": riot_id,
                     "region": region,
-                    "analysis": analysis,
                     "llm_payload": llm_payload,   # ★ここをLLM入力に使う
                     "discord_message": message,
                 }

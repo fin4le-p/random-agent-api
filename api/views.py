@@ -1,12 +1,12 @@
 # api/views.py
 import secrets
 import urllib.parse
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone as dt_timezone
 import traceback
 
 from django.conf import settings
 from django.db import transaction
-from django.utils import timezone
+from django.utils import timezone as dj_timezone
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -115,6 +115,15 @@ def _safe_int(v, default: int = 0) -> int:
         return int(v)
     except Exception:
         return default
+
+
+def _format_jst_datetime_from_millis(v) -> str:
+    ms = _safe_int(v, 0)
+    if ms <= 0:
+        return "不明"
+    dt_utc = datetime.fromtimestamp(ms / 1000, tz=dt_timezone.utc)
+    dt_jst = dt_utc.astimezone(dt_timezone(timedelta(hours=9)))
+    return dt_jst.strftime("%Y-%m-%d %H:%M:%S JST")
 
 
 def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
@@ -473,6 +482,7 @@ def _build_discord_match_message(riot_id: str, analysis: dict) -> str:
     result = "WIN" if analysis["won"] else "LOSE"
     lines = [
         f"【{result}】{riot_id}",
+        f"試合開始: {analysis.get('game_start_jst', '不明')}",
         f"マップ: {analysis['map']} / Score: {analysis['scoreline']} / Queue: {analysis.get('queueId') or '-'}",
         f"KDA: {k}/{d}/{a} (K/D {analysis['kd']}) / ACS: {analysis['acs']}",
         f"HS率: {analysis['hs_rate']}% / 生存率: {analysis['survival_rate']}% / KAST(近似): {analysis['kast_like']}%",
@@ -634,7 +644,7 @@ class InternalCreateAuthUrl(APIView):
             discord_user_id=discord_user_id,
             discord_guild_id=discord_guild_id,
             region=region,
-            expires_at=timezone.now() + timedelta(minutes=10),
+            expires_at=dj_timezone.now() + timedelta(minutes=10),
         )
 
         url = build_authorize_url(state_val)
@@ -749,7 +759,7 @@ class InternalEnsureFreshToken(APIView):
     def post(self, request):
         discord_user_id = int(request.data.get("discord_user_id", 0))
         if not discord_user_id:
-            return Response({"error": "missing_discord_user_id"}, status=400)
+            return Response({"ok": False, "error": "missing_discord_user_id"}, status=400)
 
         link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
         if not link or not hasattr(link, "token"):
@@ -815,7 +825,7 @@ class InternalMe(APIView):
 
         link = AccountLink.objects.filter(discord_user_id=discord_user_id).first()
         if not link:
-            return Response({"error": "not_linked"}, status=404)
+            return Response({"ok": False, "error": "not_linked"}, status=404)
 
         if not link.riot_puuid:
             return Response({"error": "missing_puuid"}, status=404)
@@ -901,20 +911,20 @@ class InternalValorantRecentMatches(APIView):
         # PUUID が無ければ account-v1 で埋める（公式のみ）
         if not link.riot_puuid:
             if not (link.riot_game_name and link.riot_tag_line):
-                return Response({"error": "not_linked_or_missing_riot_id"}, status=404)
+                return Response({"ok": False, "error": "not_linked_or_missing_riot_id"}, status=404)
             try:
                 acct = account_by_riot_id(link.riot_game_name, link.riot_tag_line)
                 puuid = acct.get("puuid", "") or ""
                 if not puuid:
-                    return Response({"error": "puuid_lookup_failed"}, status=502)
+                    return Response({"ok": False, "error": "puuid_lookup_failed"}, status=502)
                 link.riot_puuid = puuid
                 link.save(update_fields=["riot_puuid", "updated_at"])
             except Exception as e:
-                return Response({"error": "puuid_lookup_exception", "detail": repr(e)}, status=502)
+                return Response({"ok": False, "error": "puuid_lookup_exception", "detail": repr(e)}, status=502)
 
         api_key = getattr(settings, "RIOT_API_KEY", "")
         if not api_key:
-            return Response({"error": "server_misconfigured_riot_api_key"}, status=500)
+            return Response({"ok": False, "error": "server_misconfigured_riot_api_key"}, status=500)
 
         region = getattr(settings, "VAL_MATCH_REGION", None) or (link.region or "ap")
 
@@ -1006,19 +1016,46 @@ class InternalValorantMatchHighlight(APIView):
 
         region = getattr(settings, "VAL_MATCH_REGION", None) or (link.region or "ap")
 
+        display_riot_id = f"{link.riot_game_name}#{link.riot_tag_line}".strip("#") or "未設定RiotID"
+
         try:
             ml = matchlist_by_puuid(region, api_key, link.riot_puuid)
             history = ml.get("history", []) or []
             if not history:
-                return Response({"error": "no_match_history"}, status=404)
+                return Response({"ok": False, "error": "no_match_history"}, status=404)
 
-            latest_match_id = (history[0] or {}).get("matchId")
+            latest_match_id = None
+            latest_competitive_meta = None
+            for h in history:
+                if not h:
+                    continue
+                q = str(h.get("queueId", "") or "").strip().lower()
+                if q == "competitive":
+                    mid = h.get("matchId")
+                    if mid:
+                        latest_match_id = mid
+                        latest_competitive_meta = h
+                        break
+
             if not latest_match_id:
-                return Response({"error": "invalid_match_history"}, status=502)
+                return Response(
+                    {
+                        "ok": False,
+                        "riotId": display_riot_id,
+                        "region": region,
+                        "error": "no_competitive_match_found",
+                        "message": "match history内にCompetitiveの試合が存在しませんでした。",
+                    },
+                    status=404,
+                )
 
             match_data = match_by_id(region, api_key, latest_match_id)
             analysis = _compute_match_highlights(match_data, link.riot_puuid)
-            riot_id = f"{link.riot_game_name}#{link.riot_tag_line}".strip("#") or link.riot_puuid
+            game_start_ms = _safe_int((latest_competitive_meta or {}).get("gameStartTimeMillis"), 0)
+            if game_start_ms <= 0:
+                game_start_ms = _safe_int(((match_data.get("matchInfo", {}) or {}).get("gameStartMillis")), 0)
+            analysis["game_start_jst"] = _format_jst_datetime_from_millis(game_start_ms)
+            riot_id = display_riot_id
             message = _build_discord_match_message(riot_id, analysis)
 
             # ★追加：LLMへ投げる専用ペイロード（中身があるキーだけ出る）
@@ -1029,11 +1066,12 @@ class InternalValorantMatchHighlight(APIView):
                     "ok": True,
                     "riotId": riot_id,
                     "region": region,
+                    "gameStartAtJST": analysis["game_start_jst"],
                     "llm_payload": llm_payload,   # ★ここをLLM入力に使う
                     "discord_message": message,
                 }
             )
         except ValueError as e:
-            return Response({"error": str(e)}, status=502)
+            return Response({"ok": False, "error": str(e)}, status=502)
         except Exception as e:
-            return Response({"error": "highlight_fetch_exception", "detail": repr(e)}, status=502)
+            return Response({"ok": False, "error": "highlight_fetch_exception", "detail": repr(e)}, status=502)

@@ -353,7 +353,6 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
         clutch_breakdown[key] = clutch_breakdown.get(key, 0) + 1
 
     return {
-        "matchId": info.get("matchId"),
         "map": _map_name(info.get("mapId", "")),
         "queueId": info.get("queueId", ""),
         "won": bool((my_team or {}).get("won", False)),
@@ -870,9 +869,7 @@ class InternalValorantMatchHighlight(APIView):
                 {
                     "ok": True,
                     "riotId": riot_id,
-                    "puuid": link.riot_puuid,
                     "region": region,
-                    "matchId": latest_match_id,
                     "analysis": analysis,
                     "discord_message": message,
                 }

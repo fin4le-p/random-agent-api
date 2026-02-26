@@ -90,6 +90,8 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
     enemy_score_prog = []
     my_score = 0
     enemy_score = 0
+    round_timeline = []
+    clutch_attempts = []
 
     my_team_members = {p.get("puuid") for p in players if p.get("teamId") == my_team_id}
     enemy_members = {p.get("puuid") for p in players if p.get("teamId") != my_team_id}
@@ -151,8 +153,9 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
 
         team_alive = len(my_team_members)
         enemy_alive = len(enemy_members)
-        min_my_alive = team_alive
-        max_enemy_alive = enemy_alive
+        my_alive = True
+        clutch_attempt_vs = 0
+        my_death_time = None
         for kind, t, _killer, victim in kill_events:
             if kind == "team_kill":
                 enemy_alive = max(enemy_alive - 1, 0)
@@ -160,8 +163,12 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
                 team_alive = max(team_alive - 1, 0)
                 if victim == my_puuid and death_time is None:
                     death_time = t
-            min_my_alive = min(min_my_alive, team_alive)
-            max_enemy_alive = max(max_enemy_alive, enemy_alive)
+                    my_death_time = t
+                    my_alive = False
+
+            if my_alive and team_alive == 1 and enemy_alive >= 2:
+                clutch_attempt_vs = max(clutch_attempt_vs, enemy_alive)
+
             if death_time is not None and kind == "team_kill" and t <= death_time + 8000:
                 traded_death_rounds.add(round_num)
                 death_time = None
@@ -177,31 +184,65 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
             kast_rounds += 1
 
         won = (winning_team == my_team_id)
-        if won and kcount > 0 and min_my_alive == 1 and max_enemy_alive >= 2:
-            clutch_wins.append(
-                {
-                    "roundNum": round_num,
-                    "vs": max_enemy_alive,
-                    "kills": kcount,
-                }
-            )
 
         role = rr.get("winningTeamRole")
+        my_side = "-"
         if role == "Attacker":
-            team_side_by_round.append("ATK" if my_win else "DEF")
+            my_side = "ATK" if my_win else "DEF"
+            team_side_by_round.append(my_side)
         elif role == "Defender":
-            team_side_by_round.append("DEF" if my_win else "ATK")
+            my_side = "DEF" if my_win else "ATK"
+            team_side_by_round.append(my_side)
         else:
             team_side_by_round.append("-")
 
+        clutch_won = bool(won and clutch_attempt_vs >= 2 and not my_death)
+        if clutch_attempt_vs >= 2:
+            clutch_attempt = {
+                "roundNum": round_num,
+                "vs": clutch_attempt_vs,
+                "won": clutch_won,
+                "kills": kcount,
+            }
+            clutch_attempts.append(clutch_attempt)
+            if clutch_won:
+                clutch_wins.append(clutch_attempt)
+
+        round_timeline.append(
+            {
+                "roundNum": round_num,
+                "side": my_side,
+                "won": my_win,
+                "scoreAfterRound": f"{my_score}-{enemy_score}",
+                "kills": kcount,
+                "death": my_death,
+                "assisted": round_assist,
+                "damage": round_damage,
+                "firstBlood": round_num in first_blood_rounds,
+                "firstDeath": round_num in first_death_rounds,
+                "multiKill": kcount if kcount >= 2 else 0,
+                "clutchAttemptVs": clutch_attempt_vs if clutch_attempt_vs >= 2 else 0,
+                "clutchWon": clutch_won,
+                "survived": survived_this_round,
+                "tradedDeath": traded,
+                "deathTimeMs": my_death_time,
+            }
+        )
+
     max_deficit = 0
+    max_lead = 0
     lead_seen = False
     come_from_behind = False
-    for ms, es in zip(my_team_score_prog, enemy_score_prog):
+    max_deficit_round = None
+    for idx, (ms, es) in enumerate(zip(my_team_score_prog, enemy_score_prog)):
         diff = ms - es
         if diff > 0:
             lead_seen = True
+        if diff > max_lead:
+            max_lead = diff
         max_deficit = min(max_deficit, diff)
+        if diff == max_deficit:
+            max_deficit_round = idx
         if lead_seen and diff < 0:
             pass
         if max_deficit <= -5 and diff > 0:
@@ -236,10 +277,80 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
     if atk_rounds >= 4 and atk_wins / atk_rounds >= 0.7:
         attacker_dominant = True
 
+    max_win_streak = 0
+    max_lose_streak = 0
+    cur_win = 0
+    cur_lose = 0
+    for w in my_round_wins:
+        if w:
+            cur_win += 1
+            cur_lose = 0
+        else:
+            cur_lose += 1
+            cur_win = 0
+        if cur_win > max_win_streak:
+            max_win_streak = cur_win
+        if cur_lose > max_lose_streak:
+            max_lose_streak = cur_lose
+
+    impactful_round = None
+    best_impact = -1
+    for r in round_timeline:
+        impact = r["damage"] + (r["kills"] * 120)
+        if r["clutchWon"]:
+            impact += 450
+        if r["multiKill"] >= 4:
+            impact += 250
+        if r["firstBlood"]:
+            impact += 60
+        if impact > best_impact:
+            best_impact = impact
+            impactful_round = r
+
+    story_lines = []
+    opening_rounds = min(6, len(my_round_wins))
+    if opening_rounds >= 4:
+        opening_wins = sum(1 for i in range(opening_rounds) if my_round_wins[i])
+        if opening_wins <= 2:
+            story_lines.append(f"立ち上がりは{opening_wins}-{opening_rounds - opening_wins}で重い展開")
+        elif opening_wins >= 4:
+            story_lines.append(f"序盤{opening_wins}-{opening_rounds - opening_wins}で主導権を握った")
+
+    if half > 0:
+        story_lines.append(
+            f"前半 {first_half_wins}-{first_half_losses}、後半 {second_half_wins}-{second_half_losses}"
+        )
+
+    if come_from_behind:
+        story_lines.append("中盤までのビハインドを終盤でひっくり返した")
+    elif max_deficit <= -4 and not bool((my_team or {}).get("won", False)):
+        story_lines.append("一度離された点差を詰め切れずに終了")
+
+    if max_win_streak >= 4:
+        story_lines.append(f"{max_win_streak}連取の流れを作れた")
+    if max_lose_streak >= 4:
+        story_lines.append(f"{max_lose_streak}連敗の時間帯が重かった")
+
+    if impactful_round:
+        extra = []
+        if impactful_round["clutchWon"]:
+            extra.append(f"1v{impactful_round['clutchAttemptVs']}クラッチ")
+        if impactful_round["multiKill"] >= 3:
+            extra.append(f"{impactful_round['multiKill']}K")
+        extra_txt = f"（{' / '.join(extra)}）" if extra else ""
+        story_lines.append(
+            f"ターニングポイントはR{impactful_round['roundNum']}の{impactful_round['damage']}ダメージ{extra_txt}"
+        )
+
     hs_rate = (hs_total / shot_total * 100.0) if shot_total else 0.0
     kd = (kills / deaths) if deaths > 0 else float(kills)
     kast = (kast_rounds / max(total_rounds, 1) * 100.0)
     survival_rate = (survived_rounds / max(total_rounds, 1) * 100.0)
+
+    clutch_breakdown = {}
+    for c in clutch_wins:
+        key = f"1v{c['vs']}"
+        clutch_breakdown[key] = clutch_breakdown.get(key, 0) + 1
 
     return {
         "matchId": info.get("matchId"),
@@ -255,7 +366,10 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
         "acs": round(score / max(rounds_played, 1), 1),
         "ace_count": len(ace_rounds),
         "ace_rounds": ace_rounds,
+        "triple_plus_kills": sum(1 for x in multi_kill_rounds if x["kills"] >= 3),
         "clutch_count": len(clutch_wins),
+        "clutch_attempt_count": len(clutch_attempts),
+        "clutch_breakdown": clutch_breakdown,
         "clutches": clutch_wins,
         "first_blood_count": len(first_blood_rounds),
         "first_death_count": len(first_death_rounds),
@@ -273,7 +387,14 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
             "overtime_battle": ot_match,
             "defense_collapsed": defender_collapsed,
             "attack_worked": attacker_dominant,
+            "max_deficit": abs(max_deficit),
+            "max_lead": max_lead,
+            "win_streak_max": max_win_streak,
+            "lose_streak_max": max_lose_streak,
+            "max_deficit_round": max_deficit_round,
         },
+        "story_lines": story_lines,
+        "round_timeline": round_timeline,
     }
 
 
@@ -298,6 +419,12 @@ def _build_discord_match_message(riot_id: str, analysis: dict) -> str:
         f"ACE: {analysis['ace_count']}回 / クラッチ: {analysis['clutch_count']}回 / "
         f"FB-FD: {analysis['first_blood_count']}-{analysis['first_death_count']}"
     )
+    lines.append(f"3K以上: {analysis.get('triple_plus_kills', 0)}回")
+
+    clutch_breakdown = analysis.get("clutch_breakdown", {}) or {}
+    if clutch_breakdown:
+        parts = [f"{k} {v}回" for k, v in sorted(clutch_breakdown.items())]
+        lines.append("クラッチ内訳: " + ", ".join(parts))
 
     max_dmg = analysis["max_damage_round"]
     if max_dmg["roundNum"] is not None:
@@ -318,6 +445,8 @@ def _build_discord_match_message(riot_id: str, analysis: dict) -> str:
 
     if story:
         lines.append("試合の流れ: " + " / ".join(story))
+    if analysis.get("story_lines"):
+        lines.append("ストーリー: " + " / ".join(analysis["story_lines"]))
 
     if not analysis["won"]:
         fail_points = []

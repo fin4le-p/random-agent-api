@@ -63,7 +63,9 @@ def _format_jst_datetime_from_millis(v) -> str:
         return "不明"
     dt_utc = datetime.fromtimestamp(ms / 1000, tz=dt_timezone.utc)
     dt_jst = dt_utc.astimezone(dt_timezone(timedelta(hours=9)))
-    return dt_jst.strftime("%Y-%m-%d %H:%M:%S JST")
+    weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+    wd = weekdays[dt_jst.weekday()]
+    return f"{dt_jst.year}年{dt_jst.month}月{dt_jst.day}日({wd}) {dt_jst:%H:%M}ごろ"
 
 
 def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:

@@ -1,93 +1,31 @@
-# api/views.py
-import secrets
-import urllib.parse
-from datetime import timedelta, datetime, timezone as dt_timezone
-import traceback
+import json
+from datetime import datetime, timedelta, timezone as dt_timezone
+from functools import lru_cache
+from pathlib import Path
 
 from django.conf import settings
-from django.db import transaction
-from django.utils import timezone as dj_timezone
 
-from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework.views import APIView
 
-from .auth import InternalAPIKeyPermission
-from .serializers import CreateAuthUrlRequest, ExchangeCodeRequest
-from .models import OAuthState, AccountLink, RiotToken
-from .crypto import encrypt, decrypt
-from .riot import (
-    exchange_code_for_token,
-    fetch_userinfo,
-    refresh_access_token,
-    calc_expires_at,
-    account_by_riot_id,
-    account_me,
-)
-from .val_match import matchlist_by_puuid, match_by_id
+from ..auth import InternalAPIKeyPermission
+from ..models import AccountLink
+from ..integrations.riot import account_by_riot_id
+from ..integrations.val_match import match_by_id, matchlist_by_puuid
 
-_MAP_LABEL_BY_ASSETPATH = {
-    "/Game/Maps/Ascent/Ascent": "アセント（Ascent）",
-    "/Game/Maps/Bonsai/Bonsai": "スプリット（Split）",
-    "/Game/Maps/Canyon/Canyon": "フラクチャー（Fracture）",
-    "/Game/Maps/Duality/Duality": "バインド（Bind）",
-    "/Game/Maps/Duel/Duel_1/Skirmish_A": "スカーミッシュ A（Skirmish A）",
-    "/Game/Maps/Duel/Duel_2/Skirmish_B": "スカーミッシュ B（Skirmish B）",
-    "/Game/Maps/Duel/Duel_3/Skirmish_C": "スカーミッシュ C（Skirmish C）",
-    "/Game/Maps/Foxtrot/Foxtrot": "ブリーズ（Breeze）",
-    "/Game/Maps/HURM/HURM_Alley/HURM_Alley": "ディストリクト（District）",
-    "/Game/Maps/HURM/HURM_Bowl/HURM_Bowl": "カスバ（Kasbah）",
-    "/Game/Maps/HURM/HURM_Helix/HURM_Helix": "ドリフト（Drift）",
-    "/Game/Maps/HURM/HURM_HighTide/HURM_HighTide": "グリッチ（Glitch）",
-    "/Game/Maps/HURM/HURM_Yard/HURM_Yard": "ピアッツァ（Piazza）",
-    "/Game/Maps/Infinity/Infinity": "アビス（Abyss）",
-    "/Game/Maps/Jam/Jam": "ロータス（Lotus）",
-    "/Game/Maps/Juliett/Juliett": "サンセット（Sunset）",
-    "/Game/Maps/NPEV2/NPEV2": "基本トレーニング（Basic Training）",
-    "/Game/Maps/Pitt/Pitt": "パール（Pearl）",
-    "/Game/Maps/Port/Port": "アイスボックス（Icebox）",
-    "/Game/Maps/Poveglia/Range": "射撃場（The Range）",
-    "/Game/Maps/PovegliaV2/RangeV2": "射撃場（The Range）",
-    "/Game/Maps/Rook/Rook": "カロード（Corrode）",
-    "/Game/Maps/Triad/Triad": "ヘイヴン（Haven）",
-}
-
-_MAP_LABEL_BY_ASSETNAME = {
-    "Ascent": "アセント（Ascent）",
-    "Bonsai": "スプリット（Split）",
-    "Canyon": "フラクチャー（Fracture）",
-    "Duality": "バインド（Bind）",
-    "Skirmish_A": "スカーミッシュ A（Skirmish A）",
-    "Skirmish_B": "スカーミッシュ B（Skirmish B）",
-    "Skirmish_C": "スカーミッシュ C（Skirmish C）",
-    "Foxtrot": "ブリーズ（Breeze）",
-    "HURM_Alley": "ディストリクト（District）",
-    "HURM_Bowl": "カスバ（Kasbah）",
-    "HURM_Helix": "ドリフト（Drift）",
-    "HURM_HighTide": "グリッチ（Glitch）",
-    "HURM_Yard": "ピアッツァ（Piazza）",
-    "Infinity": "アビス（Abyss）",
-    "Jam": "ロータス（Lotus）",
-    "Juliett": "サンセット（Sunset）",
-    "NPEV2": "基本トレーニング（Basic Training）",
-    "Pitt": "パール（Pearl）",
-    "Port": "アイスボックス（Icebox）",
-    "Range": "射撃場（The Range）",
-    "RangeV2": "射撃場（The Range）",
-    "Rook": "カロード（Corrode）",
-    "Triad": "ヘイヴン（Haven）", 
-}
+_MAP_LABELS_JSON_PATH = Path(__file__).resolve().parent / "data" / "map_labels.json"
 
 
-def build_authorize_url(state: str) -> str:
-    params = {
-        "client_id": settings.RIOT_CLIENT_ID,
-        "redirect_uri": settings.RIOT_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "openid offline_access",
-        "state": state,
-    }
-    return f"{settings.RIOT_AUTH_BASE.rstrip('/')}/authorize?" + urllib.parse.urlencode(params)
+@lru_cache(maxsize=1)
+def _load_map_labels() -> tuple[dict, dict]:
+    try:
+        data = json.loads(_MAP_LABELS_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, {}
+
+    by_assetpath = data.get("by_assetpath", {}) or {}
+    by_assetname = data.get("by_assetname", {}) or {}
+    return by_assetpath, by_assetname
 
 
 def _map_name(map_id: str) -> str:
@@ -95,18 +33,20 @@ def _map_name(map_id: str) -> str:
     if not raw:
         return raw
 
+    label_by_assetpath, label_by_assetname = _load_map_labels()
+
     # 1) assetPath 完全一致
-    label = _MAP_LABEL_BY_ASSETPATH.get(raw)
+    label = label_by_assetpath.get(raw)
     if label:
         return label
 
     # 2) 末尾キー（Infinity / Triad / ...）で一致
     tail = raw.strip("/").split("/")[-1] or raw
-    label = _MAP_LABEL_BY_ASSETNAME.get(tail)
+    label = label_by_assetname.get(tail)
     if label:
         return label
 
-    # 3) どちらも無ければ従来どおり末尾を返す（Unknownにはしない）
+    # 3) どちらも無ければ元の文字列を返す
     return tail
 
 
@@ -173,7 +113,7 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
     for rr in rounds:
         round_num = _safe_int(rr.get("roundNum"), -1)
         winning_team = rr.get("winningTeam")
-        my_win = (winning_team == my_team_id)
+        my_win = winning_team == my_team_id
         my_round_wins.append(my_win)
         if my_win:
             my_score += 1
@@ -257,7 +197,7 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
         if (kcount > 0) or round_assist or survived_this_round or traded:
             kast_rounds += 1
 
-        won = (winning_team == my_team_id)
+        won = winning_team == my_team_id
 
         role = rr.get("winningTeamRole")
         my_side = "-"
@@ -422,8 +362,8 @@ def _compute_match_highlights(match_data: dict, my_puuid: str) -> dict:
 
     hs_rate = (hs_total / shot_total * 100.0) if shot_total else 0.0
     kd = (kills / deaths) if deaths > 0 else float(kills)
-    kast = (kast_rounds / max(total_rounds, 1) * 100.0)
-    survival_rate = (survived_rounds / max(total_rounds, 1) * 100.0)
+    kast = kast_rounds / max(total_rounds, 1) * 100.0
+    survival_rate = survived_rounds / max(total_rounds, 1) * 100.0
 
     clutch_breakdown = {}
     for c in clutch_wins:
@@ -627,195 +567,12 @@ def _build_llm_payload(riot_id: str, analysis: dict) -> dict:
     return payload
 
 
-class InternalCreateAuthUrl(APIView):
-    permission_classes = [InternalAPIKeyPermission]
-
-    def post(self, request):
-        ser = CreateAuthUrlRequest(data=request.data)
-        ser.is_valid(raise_exception=True)
-
-        discord_user_id = int(ser.validated_data["discord_user_id"])
-        discord_guild_id = ser.validated_data.get("discord_guild_id")
-        region = ser.validated_data.get("region") or "ap"
-
-        state_val = secrets.token_urlsafe(32)
-        OAuthState.objects.create(
-            state=state_val,
-            discord_user_id=discord_user_id,
-            discord_guild_id=discord_guild_id,
-            region=region,
-            expires_at=dj_timezone.now() + timedelta(minutes=10),
-        )
-
-        url = build_authorize_url(state_val)
-        return Response({"authorize_url": url, "state": state_val, "region": region})
-
-
-class InternalExchangeCode(APIView):
-    """
-    Link（callback）時点で gameName/tagLine/puuid まで確定させて保存する
-    """
-    permission_classes = [InternalAPIKeyPermission]
-
-    @transaction.atomic
-    def post(self, request):
-        ser = ExchangeCodeRequest(data=request.data)
-        ser.is_valid(raise_exception=True)
-        code = ser.validated_data["code"]
-        state_val = ser.validated_data["state"]
-
-        st = OAuthState.objects.filter(state=state_val).first()
-        if not st or st.is_expired():
-            return Response({"error": "invalid_or_expired_state"}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            token_json = exchange_code_for_token(code)
-
-            access_token = token_json["access_token"]
-            refresh_token = token_json.get("refresh_token")
-            if not refresh_token:
-                return Response(
-                    {"error": "missing_refresh_token", "token_keys": list(token_json.keys())},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            expires_at = calc_expires_at(int(token_json.get("expires_in", 3600)))
-            scope = token_json.get("scope", "")
-            token_type = token_json.get("token_type", "Bearer")
-
-            # ★1) sub は userinfo（openid）で取れるなら取る（無くても通す）
-            riot_subject = ""
-            try:
-                userinfo = fetch_userinfo(access_token)
-                riot_subject = userinfo.get("sub", "") or ""
-            except Exception:
-                riot_subject = ""
-
-            # ★2) ここが本命：公式 accounts/me で puuid / gameName / tagLine を確定
-            me = account_me(access_token)
-            game_name = me.get("gameName", "") or ""
-            tag_line = me.get("tagLine", "") or ""
-            puuid = me.get("puuid", "") or ""
-
-            # accounts/me が一部欠けるケースの保険（公式のみ）
-            # gameName/tagLine が取れてるのに puuid が空なら account-v1 by-riot-id で補完
-            if (not puuid) and game_name and tag_line:
-                try:
-                    acct = account_by_riot_id(game_name, tag_line)
-                    puuid = acct.get("puuid", "") or ""
-                except Exception:
-                    puuid = ""
-
-            link, _created = AccountLink.objects.update_or_create(
-                discord_user_id=st.discord_user_id,
-                defaults={
-                    "discord_guild_id": st.discord_guild_id,
-                    "riot_subject": riot_subject,
-                    "riot_game_name": game_name,
-                    "riot_tag_line": tag_line,
-                    "riot_puuid": puuid,
-                    "region": st.region or "ap",
-                },
-            )
-
-            RiotToken.objects.update_or_create(
-                link=link,
-                defaults={
-                    "access_token": access_token,
-                    "refresh_token_enc": encrypt(refresh_token),
-                    "expires_at": expires_at,
-                    "scope": scope,
-                    "token_type": token_type,
-                },
-            )
-
-            st.delete()
-
-            return Response(
-                {
-                    "ok": True,
-                    "discord_user_id": link.discord_user_id,
-                    "riot_subject": link.riot_subject,
-                    "riot_game_name": link.riot_game_name,
-                    "riot_tag_line": link.riot_tag_line,
-                    "riot_puuid": link.riot_puuid,
-                }
-            )
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            print("[InternalExchangeCode] exception:", repr(e))
-            print(tb)
-            return Response(
-                {"error": "exchange_exception", "detail": repr(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-
-class InternalEnsureFreshToken(APIView):
-    permission_classes = [InternalAPIKeyPermission]
-
-    @transaction.atomic
-    def post(self, request):
-        discord_user_id = int(request.data.get("discord_user_id", 0))
-        if not discord_user_id:
-            return Response({"ok": False, "error": "missing_discord_user_id"}, status=400)
-
-        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
-        if not link or not hasattr(link, "token"):
-            return Response({"error": "not_linked"}, status=404)
-
-        tok = link.token
-        if not tok.is_expired():
-            return Response({"ok": True, "refreshed": False})
-
-        refresh_token = decrypt(tok.refresh_token_enc)
-        new_tok = refresh_access_token(refresh_token)
-
-        tok.access_token = new_tok["access_token"]
-        new_refresh = new_tok.get("refresh_token")
-        if new_refresh:
-            tok.refresh_token_enc = encrypt(new_refresh)
-        tok.expires_at = calc_expires_at(int(new_tok.get("expires_in", 3600)))
-        tok.scope = new_tok.get("scope", tok.scope)
-        tok.token_type = new_tok.get("token_type", tok.token_type)
-        tok.save(update_fields=["access_token", "refresh_token_enc", "expires_at", "scope", "token_type", "updated_at"])
-
-        return Response({"ok": True, "refreshed": True})
-
-
-class InternalLinkStatus(APIView):
-    permission_classes = [InternalAPIKeyPermission]
-
-    def post(self, request):
-        discord_user_id = int(request.data.get("discord_user_id", 0))
-        if not discord_user_id:
-            return Response({"error": "missing_discord_user_id"}, status=400)
-
-        link = AccountLink.objects.filter(discord_user_id=discord_user_id).select_related("token").first()
-        if not link:
-            return Response({"linked": False}, status=200)
-
-        has_token = hasattr(link, "token")
-        return Response(
-            {
-                "linked": True,
-                "has_token": bool(has_token),
-                "riot_game_name": link.riot_game_name,
-                "riot_tag_line": link.riot_tag_line,
-                "riot_subject": link.riot_subject,
-                "riot_puuid": link.riot_puuid,
-                "expires_at": link.token.expires_at if has_token else None,
-            },
-            status=200,
-        )
-
-
 class InternalMe(APIView):
     """
     連携確認ではなく「直近1試合が取れる」ことを確認するためのエンドポイント
     - refresh 等はここではやらない（連携機能は無視）
     """
+
     permission_classes = [InternalAPIKeyPermission]
 
     def post(self, request):
@@ -838,7 +595,7 @@ class InternalMe(APIView):
 
         try:
             ml = matchlist_by_puuid(region, api_key, link.riot_puuid)
-            history = (ml.get("history", []) or [])
+            history = ml.get("history", []) or []
             if not history:
                 return Response({"error": "no_match_history"}, status=404)
 
@@ -1067,7 +824,7 @@ class InternalValorantMatchHighlight(APIView):
                     "riotId": riot_id,
                     "region": region,
                     "gameStartAtJST": analysis["game_start_jst"],
-                    "llm_payload": llm_payload,   # ★ここをLLM入力に使う
+                    "llm_payload": llm_payload,  # ★ここをLLM入力に使う
                     "discord_message": message,
                 }
             )

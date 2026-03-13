@@ -23,30 +23,5 @@
     "/Game/Maps/PovegliaV2/RangeV2": "射撃場（The Range）",
     "/Game/Maps/Rook/Rook": "カロード（Corrode）",
     "/Game/Maps/Triad/Triad": "ヘイヴン（Haven）"
-  },
-  "by_assetname": {
-    "Ascent": "アセント（Ascent）",
-    "Bonsai": "スプリット（Split）",
-    "Canyon": "フラクチャー（Fracture）",
-    "Duality": "バインド（Bind）",
-    "Skirmish_A": "スカーミッシュ A（Skirmish A）",
-    "Skirmish_B": "スカーミッシュ B（Skirmish B）",
-    "Skirmish_C": "スカーミッシュ C（Skirmish C）",
-    "Foxtrot": "ブリーズ（Breeze）",
-    "HURM_Alley": "ディストリクト（District）",
-    "HURM_Bowl": "カスバ（Kasbah）",
-    "HURM_Helix": "ドリフト（Drift）",
-    "HURM_HighTide": "グリッチ（Glitch）",
-    "HURM_Yard": "ピアッツァ（Piazza）",
-    "Infinity": "アビス（Abyss）",
-    "Jam": "ロータス（Lotus）",
-    "Juliett": "サンセット（Sunset）",
-    "NPEV2": "基本トレーニング（Basic Training）",
-    "Pitt": "パール（Pearl）",
-    "Port": "アイスボックス（Icebox）",
-    "Range": "射撃場（The Range）",
-    "RangeV2": "射撃場（The Range）",
-    "Rook": "カロード（Corrode）",
-    "Triad": "ヘイヴン（Haven）"
   }
 }

@@ -48,3 +48,15 @@ class RiotToken(models.Model):
 
     def is_expired(self, leeway_seconds: int = 30) -> bool:
         return timezone.now() >= (self.expires_at - timedelta(seconds=leeway_seconds))
+
+
+class ValorantMap(models.Model):
+    asset_path = models.CharField(max_length=255, unique=True)
+    asset_name = models.CharField(max_length=128, blank=True, default="", db_index=True)
+    display_name = models.CharField(max_length=128)
+    is_rank_map_pool = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return self.display_name

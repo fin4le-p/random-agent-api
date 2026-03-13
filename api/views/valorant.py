@@ -1,7 +1,4 @@
-import json
 from datetime import datetime, timedelta, timezone as dt_timezone
-from functools import lru_cache
-from pathlib import Path
 
 from django.conf import settings
 
@@ -9,23 +6,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..auth import InternalAPIKeyPermission
-from ..models import AccountLink
+from ..models import AccountLink, ValorantMap
 from ..integrations.riot import account_by_riot_id
 from ..integrations.val_match import match_by_id, matchlist_by_puuid
-
-_MAP_LABELS_JSON_PATH = Path(__file__).resolve().parent / "data" / "map_labels.json"
-
-
-@lru_cache(maxsize=1)
-def _load_map_labels() -> tuple[dict, dict]:
-    try:
-        data = json.loads(_MAP_LABELS_JSON_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}, {}
-
-    by_assetpath = data.get("by_assetpath", {}) or {}
-    by_assetname = data.get("by_assetname", {}) or {}
-    return by_assetpath, by_assetname
 
 
 def _map_name(map_id: str) -> str:
@@ -33,20 +16,23 @@ def _map_name(map_id: str) -> str:
     if not raw:
         return raw
 
-    label_by_assetpath, label_by_assetname = _load_map_labels()
-
-    # 1) assetPath 完全一致
-    label = label_by_assetpath.get(raw)
-    if label:
-        return label
-
-    # 2) 末尾キー（Infinity / Triad / ...）で一致
     tail = raw.strip("/").split("/")[-1] or raw
-    label = label_by_assetname.get(tail)
-    if label:
-        return label
+    exact = (
+        ValorantMap.objects.filter(asset_path=raw)
+        .values_list("display_name", flat=True)
+        .first()
+    )
+    if exact:
+        return exact
 
-    # 3) どちらも無ければ元の文字列を返す
+    fallback = (
+        ValorantMap.objects.filter(asset_name=tail)
+        .values_list("display_name", flat=True)
+        .first()
+    )
+    if fallback:
+        return fallback
+
     return tail
 
 
